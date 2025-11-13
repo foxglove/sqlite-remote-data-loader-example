@@ -1,0 +1,15 @@
+[package]
+name = "connector-upstream-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.6"
+bytes = "1.10.1"
+chrono = { version = "0.4.42", features = [ "serde" ] }
+futures = "0.3.31"
+mcap = "0.23.4"
+serde = { version = "1.0.228", features = [ "derive" ] }
+serde_url_params = "0.2.1"
+serde_with = { version = "3.15.1", features = [ "base64" ] }
+tokio = { version = "1.48.0", features = [ "rt-multi-thread", "fs", "io-util" ] }
