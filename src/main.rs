@@ -62,6 +62,7 @@ struct ManifestQueryParams {
 #[serde(rename_all = "camelCase")]
 struct DataQueryParams {
     topic_name: String,
+    recording_name: String,
     start_time: chrono::DateTime<Utc>,
     end_time: chrono::DateTime<Utc>,
 }
@@ -70,6 +71,12 @@ fn internal_error(msg: impl Into<String>) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, msg.into()).into_response()
 }
 
+/// This endpoint returns a manifest file for the requested recording.
+///
+/// This manifest returns separate source URLs for each topic to demonstrate how a single recording
+/// could be split up into multiple source URLs. You might split up your recording by time range,
+/// you may put topics that are commonly used in the same layouts together, or split out topics
+/// that are quite large into their own source URL.
 async fn get_manifest(
     Query(params): Query<ManifestQueryParams>,
 ) -> Result<Json<Manifest>, Response> {
@@ -82,6 +89,7 @@ async fn get_manifest(
         .await
         .expect("failed to open db");
 
+    // Query all the topics for this recording and their start and end times.
     let topics = client.query::<(u64, u64, String)>(
         "select min(s.timestamp), max(s.timestamp), t.name FROM signals s
            INNER JOIN recordings r ON r.id = s.recording_id
@@ -92,22 +100,28 @@ async fn get_manifest(
     );
 
     let topics = topics.try_collect::<Vec<_>>().await.map_err(|e| {
-        eprintln!("failed to read manifest: {e}");
+        eprintln!("failed to read manifest from db: {e}");
         internal_error("failed to read manifest from db")
     })?;
 
     let mut sources = vec![];
 
+    // We use this Point schema created using the Foxglove SDK. It contains most of the fields required
+    // by the manifest endpoint.
     let schema = Point::get_schema().expect("point should have schema");
 
     for (start_nanos, end_nanos, topic_name) in topics.into_iter() {
+        // The schema_id on the topic needs to match the id on the schemas array in the manifest.
+        // This repo only uses a single schema - so just hard code this to one.
         let schema_id = NonZeroU16::new(1).unwrap();
 
+        // We're using nanoseconds in our sqlite database, but the manifest expects ISO timestamps.
         let start_time = DateTime::from_timestamp_nanos(start_nanos as _);
         let end_time = DateTime::from_timestamp_nanos(end_nanos as _);
 
         let params = serde_url_params::to_string(&DataQueryParams {
             topic_name: topic_name.clone(),
+            recording_name: recording.clone(),
             start_time,
             end_time,
         })
@@ -126,6 +140,8 @@ async fn get_manifest(
             }],
             start_time,
             end_time,
+            // This project expects the server to be hosted at localhost:3000. This should be a
+            // hostname that the external connector can reach from your cluster.
             data_url: format!("http://localhost:3000/data?{params}"),
         })
     }
@@ -133,6 +149,7 @@ async fn get_manifest(
     Ok(Json(Manifest { sources }))
 }
 
+// This is some glue that makes it easier for the Foxglove MCAP writer to return bytes to Axum.
 #[derive(Clone, Default)]
 struct SharedBuffer {
     buffer: Arc<Mutex<BytesMut>>,
@@ -159,6 +176,8 @@ impl Write for SharedBuffer {
     }
 }
 
+// We set the `disable_seeking` option on the MCAP writer to ensure that it doesn't seek. This impl
+// makes sure it can still get the current position of the stream.
 impl Seek for SharedBuffer {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match pos {
@@ -177,6 +196,7 @@ struct Point {
 async fn get_data(Query(params): Query<DataQueryParams>) -> Result<Response, Response> {
     let DataQueryParams {
         topic_name,
+        recording_name,
         start_time,
         end_time,
     } = params;
@@ -221,8 +241,9 @@ async fn get_data(Query(params): Query<DataQueryParams>) -> Result<Response, Res
         let mut rows = client.query::<(u64, f64)>(
             "SELECT s.timestamp, s.value FROM signals s
                 INNER JOIN topics t ON t.id = s.topic_id
-                WHERE s.timestamp >= ? AND s.timestamp <= ? AND t.name = ?",
-            asqlite::params!(start_time_nanos, end_time_nanos, topic_name),
+                INNER JOIN recordings r ON r.id = s.topic_id
+                WHERE s.timestamp >= ? AND s.timestamp <= ? AND t.name = ? AND r.name = ?",
+            asqlite::params!(start_time_nanos, end_time_nanos, topic_name, recording_name),
         );
 
         while let Some((timestamp, value)) =
