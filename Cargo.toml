@@ -1,14 +1,23 @@
 [package]
-name = "connector-upstream-test"
+name = "example-connector-upstream-api"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[[bin]]
+name = "seed"
+path = "src/bin/seed.rs"
+
 [dependencies]
+asqlite = { version = "1.2.0", features = [ "bundled" ] }
 axum = "0.8.6"
 bytes = "1.10.1"
 chrono = { version = "0.4.42", features = [ "serde" ] }
+foxglove = "0.15.3"
 futures = "0.3.31"
-mcap = "0.23.4"
 serde = { version = "1.0.228", features = [ "derive" ] }
 serde_url_params = "0.2.1"
 serde_with = { version = "3.15.1", features = [ "base64" ] }

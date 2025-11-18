@@ -1,7 +1,21 @@
-# connector-upstream-test
+# sqlite-connector-upstream-example
 
-This is an example connector that reads and streams back local files. It returns a manifest that returns sources of 10MB or so chunks to provide better streaming performance.
+This is an example connector upstream API that connects to an SQLITE database.
 
 ## Running
 
-Put MCAPs in the `files` directory and then run the server. Query the manifest endpoint like so: `/manifest?name=<my file in files>.mcap`.
+Start by running the seed binary to create a database with test data:
+
+```sh
+cargo run --bin seed --release
+```
+
+This will create a database at `signals.db`.
+
+With this database created, start the server with the following:
+
+```sh
+cargo run --bin server --release
+```
+
+This will launch the server on `localhost:3000`.

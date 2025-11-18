@@ -1,6 +1,5 @@
-use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::io::{BufWriter, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex};
 
@@ -11,16 +10,13 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::get};
 use bytes::{BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use futures::{SinkExt, StreamExt};
-use mcap::Summary;
-use mcap::records::ChunkIndex;
-use mcap::write::NoSeek;
+use futures::{SinkExt, StreamExt, TryStreamExt};
+
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
 use serde_with::serde_as;
 
-use mcap::sans_io::{SummaryReadEvent, SummaryReader, indexed_reader::*};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use foxglove::{Context, Encode, McapWriteOptions, McapWriter};
 
 #[serde_as]
 #[derive(Serialize, Clone)]
@@ -59,191 +55,102 @@ struct Manifest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestQueryParams {
-    name: String,
+    recording: String,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DataQueryParams {
-    name: String,
+    topic_name: String,
     start_time: chrono::DateTime<Utc>,
     end_time: chrono::DateTime<Utc>,
-}
-
-async fn read_summary(
-    file: &mut tokio::io::BufReader<tokio::fs::File>,
-) -> Result<Summary, Response> {
-    let mut summary_reader = SummaryReader::new();
-
-    while let Some(event) = summary_reader.next_event() {
-        let event = event.map_err(|_| internal_error("summary reader returned error"))?;
-
-        match event {
-            SummaryReadEvent::ReadRequest(amt) => {
-                let buf = summary_reader.insert(amt);
-                let amt = file
-                    .read_exact(buf)
-                    .await
-                    .map_err(|_| internal_error("failed to read summary bytes"))?;
-                summary_reader.notify_read(amt);
-            }
-            SummaryReadEvent::SeekRequest(pos) => {
-                let pos = file
-                    .seek(pos)
-                    .await
-                    .map_err(|_| internal_error("failed to seek summary"))?;
-                summary_reader.notify_seeked(pos);
-            }
-        }
-    }
-
-    let summary = summary_reader
-        .finish()
-        .ok_or_else(|| internal_error("missing summary"))?;
-
-    Ok(summary)
-}
-
-async fn get_manifest(
-    Query(params): Query<ManifestQueryParams>,
-) -> Result<Json<Manifest>, Response> {
-    let ManifestQueryParams { name } = params;
-
-    let file = tokio::fs::File::open(format!("./files/{name}"))
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND).into_response())?;
-
-    let mut file = tokio::io::BufReader::new(file);
-
-    let mut summary = read_summary(&mut file).await?;
-
-    // Sort chunks by the order they appear
-    summary
-        .chunk_indexes
-        .sort_by(|a, b| a.chunk_start_offset.cmp(&b.chunk_start_offset));
-
-    let mut topics = vec![];
-    let mut schemas = vec![];
-
-    for channel in summary.channels.values() {
-        let schema_id = if let Some(schema) = &channel.schema {
-            let id = NonZeroU16::new(schema.id).expect("schema id should never be zero");
-
-            schemas.push(Schema {
-                id,
-                name: schema.name.clone(),
-                data: schema.data.to_vec(),
-                encoding: schema.encoding.clone(),
-            });
-
-            Some(id)
-        } else {
-            None
-        };
-
-        topics.push(Topic {
-            name: channel.topic.clone(),
-            schema_id,
-        });
-    }
-
-    if summary.chunk_indexes.is_empty() {
-        // No chunks no worries!
-        return Ok(Json(Manifest { sources: vec![] }));
-    };
-
-    let mut current_chunks = vec![];
-    let mut chunk_size = 0;
-
-    let mut sources = vec![];
-
-    fn chunks_to_source(
-        name: String,
-        schemas: Vec<Schema>,
-        topics: Vec<Topic>,
-        chunks: &Vec<&ChunkIndex>,
-    ) -> Result<Source, Response> {
-        let first = chunks.first().expect("there will be at least one chunk");
-        let last = chunks.last().expect("there will be at least one chunk");
-
-        let start_time = DateTime::from_timestamp_nanos(
-            first
-                .message_start_time
-                .try_into()
-                .map_err(|_| internal_error("failed to convert start time to i64"))?,
-        );
-
-        let end_time = DateTime::from_timestamp_nanos(
-            last.message_end_time
-                .try_into()
-                .map_err(|_| internal_error("failed to convert end time to i64"))?,
-        );
-
-        let params = serde_url_params::to_string(&DataQueryParams {
-            name: name.clone(),
-            start_time,
-            end_time,
-        })
-        .map_err(|_| internal_error("failed to serialize url params"))?;
-
-        Ok(Source {
-            start_time,
-            end_time,
-            topics,
-            schemas,
-            data_url: format!("/data?{params}"),
-        })
-    }
-
-    for chunk in summary.chunk_indexes.iter() {
-        current_chunks.push(chunk);
-        chunk_size += chunk.chunk_length;
-
-        // Break up into 20MB sources
-        let max_size = 20 * 1024 * 1024;
-
-        if chunk_size > max_size {
-            let source = chunks_to_source(
-                name.clone(),
-                schemas.clone(),
-                topics.clone(),
-                &current_chunks,
-            )?;
-            sources.push(source);
-        }
-    }
-
-    if !current_chunks.is_empty() {
-        let source = chunks_to_source(
-            name.clone(),
-            schemas.clone(),
-            topics.clone(),
-            &current_chunks,
-        )?;
-        sources.push(source);
-    }
-
-    Ok(Json(Manifest { sources }))
 }
 
 fn internal_error(msg: impl Into<String>) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, msg.into()).into_response()
 }
 
+async fn get_manifest(
+    Query(params): Query<ManifestQueryParams>,
+) -> Result<Json<Manifest>, Response> {
+    let ManifestQueryParams { recording } = params;
+
+    let mut client = asqlite::Connection::builder()
+        .create(false)
+        .write(false)
+        .open("signals.db")
+        .await
+        .expect("failed to open db");
+
+    let topics = client.query::<(u64, u64, String)>(
+        "select min(s.timestamp), max(s.timestamp), t.name FROM signals s
+           INNER JOIN recordings r ON r.id = s.recording_id
+           INNER JOIN topics t ON t.id = s.topic_id
+           WHERE r.name = ?
+        ",
+        asqlite::params!(&recording),
+    );
+
+    let topics = topics.try_collect::<Vec<_>>().await.map_err(|e| {
+        eprintln!("failed to read manifest: {e}");
+        internal_error("failed to read manifest from db")
+    })?;
+
+    let mut sources = vec![];
+
+    let schema = Point::get_schema().expect("point should have schema");
+
+    for (start_nanos, end_nanos, topic_name) in topics.into_iter() {
+        let schema_id = NonZeroU16::new(1).unwrap();
+
+        let start_time = DateTime::from_timestamp_nanos(start_nanos as _);
+        let end_time = DateTime::from_timestamp_nanos(end_nanos as _);
+
+        let params = serde_url_params::to_string(&DataQueryParams {
+            topic_name: topic_name.clone(),
+            start_time,
+            end_time,
+        })
+        .map_err(|_| internal_error("failed to serialize url params"))?;
+
+        sources.push(Source {
+            topics: vec![Topic {
+                name: topic_name,
+                schema_id: Some(schema_id),
+            }],
+            schemas: vec![Schema {
+                id: schema_id,
+                name: schema.name.clone(),
+                data: schema.data.to_vec(),
+                encoding: schema.encoding.clone(),
+            }],
+            start_time,
+            end_time,
+            data_url: format!("http://localhost:3000/data?{params}"),
+        })
+    }
+
+    Ok(Json(Manifest { sources }))
+}
+
 #[derive(Clone, Default)]
-struct SharedBuffer(Arc<Mutex<BytesMut>>);
+struct SharedBuffer {
+    buffer: Arc<Mutex<BytesMut>>,
+    pos: u64,
+}
 
 impl SharedBuffer {
     fn take(&self) -> Bytes {
-        let bytes = &mut *self.0.lock().expect("poisoned");
+        let bytes = &mut *self.buffer.lock().expect("poisoned");
         bytes.split().freeze()
     }
 }
 
 impl Write for SharedBuffer {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let bytes = &mut *self.0.lock().expect("poisoned");
+        let bytes = &mut *self.buffer.lock().expect("poisoned");
         bytes.put_slice(buf);
+        self.pos += buf.len() as u64;
         Ok(buf.len())
     }
 
@@ -252,125 +159,96 @@ impl Write for SharedBuffer {
     }
 }
 
+impl Seek for SharedBuffer {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match pos {
+            SeekFrom::Start(n) if self.pos == n => Ok(n),
+            SeekFrom::Current(0) => Ok(self.pos),
+            _ => Err(std::io::Error::other("seek on unseekable file")),
+        }
+    }
+}
+
+#[derive(foxglove::Encode)]
+struct Point {
+    value: f64,
+}
+
 async fn get_data(Query(params): Query<DataQueryParams>) -> Result<Response, Response> {
     let DataQueryParams {
-        name,
+        topic_name,
         start_time,
         end_time,
     } = params;
 
-    let file = tokio::fs::File::open(format!("./files/{name}"))
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND).into_response())?;
-
-    let mut file = tokio::io::BufReader::new(file);
-
-    let summary = read_summary(&mut file).await?;
-
-    let start = u64::try_from(
+    let start_time_nanos = u64::try_from(
         start_time
             .timestamp_nanos_opt()
-            .ok_or_else(|| internal_error("start time was invalid date"))?,
+            .ok_or_else(|| internal_error("failed to convert start time to nanos"))?,
     )
     .map_err(|_| internal_error("start time was negative"))?;
 
-    let end = u64::try_from(
+    let end_time_nanos = u64::try_from(
         end_time
             .timestamp_nanos_opt()
-            .ok_or_else(|| internal_error("end time was invalid date"))?,
+            .ok_or_else(|| internal_error("failed to convert end time to nanos"))?,
     )
     .map_err(|_| internal_error("end time was negative"))?;
-
-    let mut reader = IndexedReader::new_with_options(
-        &summary,
-        IndexedReaderOptions::new()
-            .log_time_on_or_after(start)
-            .log_time_before(end),
-    )
-    .map_err(|_| internal_error("failed to create reader"))?;
-
-    let mut chunk_buffer = vec![];
-    let shared_buffer = SharedBuffer::default();
-
-    let mut writer = mcap::WriteOptions::new()
-        .disable_seeking(true)
-        .create(NoSeek::new(BufWriter::new(shared_buffer.clone())))
-        .map_err(|_| internal_error("failed to create writer"))?;
-
-    let mut old_channel_to_new_channel = BTreeMap::new();
-
-    // Write all the required channels
-    for channel in summary.channels.values() {
-        let id = if let Some(schema) = &channel.schema {
-            writer
-                .add_schema(&schema.name, &schema.encoding, &schema.data)
-                .map_err(|_| internal_error("failed to write schema"))?
-        } else {
-            0
-        };
-
-        let new_channel_id = writer
-            .add_channel(
-                id,
-                &channel.topic,
-                &channel.message_encoding,
-                &channel.metadata,
-            )
-            .map_err(|_| internal_error("failed to write channel"))?;
-
-        old_channel_to_new_channel.insert(channel.id, new_channel_id);
-    }
 
     let (mut sender, recv) = futures::channel::mpsc::channel::<Bytes>(2);
 
     tokio::spawn(async move {
-        let res: Result<(), Box<dyn std::error::Error>> = async {
-            while let Some(event) = reader.next_event() {
-                let bytes = shared_buffer.take();
+        let buffer = SharedBuffer::default();
 
-                if !bytes.is_empty()
-                    && let Err(_) = sender.send(bytes).await
-                {
-                    return Ok(());
-                }
+        let context = Context::new();
 
-                let event = event?;
+        let writer = McapWriter::with_options(McapWriteOptions::new().disable_seeking(true))
+            .context(&context)
+            .create(buffer.clone())
+            .expect("failed to create writer");
 
-                match event {
-                    IndexedReadEvent::Message { mut header, data } => {
-                        let Some(new_channel_id) =
-                            old_channel_to_new_channel.get(&header.channel_id)
-                        else {
-                            continue;
-                        };
+        let channel = context
+            .channel_builder(format!("/{topic_name}"))
+            .build::<Point>();
 
-                        header.channel_id = *new_channel_id;
-                        writer.write_to_known_channel(&header, data)?;
-                    }
-                    IndexedReadEvent::ReadChunkRequest { offset, length } => {
-                        chunk_buffer.resize(length, 0);
-                        file.seek(SeekFrom::Start(offset)).await?;
-                        file.read_exact(&mut chunk_buffer).await?;
-                        reader.insert_chunk_record_data(offset, &chunk_buffer[..])?;
-                    }
-                }
-            }
+        let mut client = asqlite::Connection::builder()
+            .create(false)
+            .write(false)
+            .open("signals.db")
+            .await
+            .expect("failed to open db");
 
-            writer.finish()?;
+        let mut rows = client.query::<(u64, f64)>(
+            "SELECT s.timestamp, s.value FROM signals s
+                INNER JOIN topics t ON t.id = s.topic_id
+                WHERE s.timestamp >= ? AND s.timestamp <= ? AND t.name = ?",
+            asqlite::params!(start_time_nanos, end_time_nanos, topic_name),
+        );
 
-            let bytes = shared_buffer.take();
+        while let Some((timestamp, value)) =
+            rows.next().await.transpose().expect("failed to read row")
+        {
+            channel.log_with_time(&Point { value }, timestamp);
+
+            let bytes = buffer.take();
 
             if !bytes.is_empty() {
-                let _ = sender.send(bytes).await;
+                sender.send(bytes).await.expect("failed to send bytes");
             }
-
-            Ok(())
         }
-        .await;
 
-        if let Err(e) = res {
-            eprintln!("err: {e}");
+        writer.close().expect("failed to close writer");
+
+        // If the context is dropped before the writer is closed it'll stop logging messages
+        drop(context);
+
+        let bytes = buffer.take();
+
+        if !bytes.is_empty() {
+            sender.send(bytes).await.expect("failed to send bytes");
         }
+
+        sender.flush().await.unwrap();
     });
 
     Ok((
@@ -383,8 +261,10 @@ async fn get_data(Query(params): Query<DataQueryParams>) -> Result<Response, Res
 #[tokio::main]
 async fn main() {
     let app = Router::new()
-        .route("/data", get(get_data))
-        .route("/manifest", get(get_manifest));
+        // The manifest endpoint required by the external connector
+        .route("/manifest", get(get_manifest))
+        // The data that backs the "source url" provided in the manifest
+        .route("/data", get(get_data));
 
     println!("Listening on http://127.0.0.1:3000");
 
