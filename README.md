@@ -19,3 +19,11 @@ cargo run --bin server --release
 ```
 
 This will launch the server on `localhost:3000`.
+
+### Visualize Data
+
+To view this data in Foxglove, start an `external-connector` and view recordings with:
+
+```
+https://app.foxglove.dev/~/view?ds=experimental-external-connector&connectorUrl=$(url-encode connectorUrl)&manifestUrl=$(url-encode http://localhost:3000/manifest?recording=first-recording)
+```
