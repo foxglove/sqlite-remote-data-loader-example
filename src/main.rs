@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::get};
 use bytes::{BufMut, Bytes, BytesMut};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::{SinkExt, StreamExt, TryStreamExt};
 
 use serde::{Deserialize, Serialize};
@@ -74,10 +74,11 @@ fn internal_error(msg: impl Into<String>) -> Response {
 
 /// This endpoint returns a manifest file for the requested recording.
 ///
-/// This manifest returns separate source URLs for each topic to demonstrate how a single recording
-/// could be split up into multiple source URLs. You might split up your recording by time range,
-/// you may put topics that are commonly used in the same layouts together, or split out topics
-/// that are quite large into their own source URL.
+/// This manifest returns separate source URLs for each topic in 10s chunks to demonstrate how a
+/// single recording could be split up into multiple source URLs. It is recommended to split up
+/// your recording into reasonable time ranges so that only the data that is needed is downloaded
+/// by the connector. You may also group topics that are commonly used in the same layouts
+/// together, or split topics out that are quite large into their own source URL.
 async fn get_manifest(
     Query(params): Query<ManifestQueryParams>,
 ) -> Result<Json<Manifest>, Response> {
@@ -120,35 +121,48 @@ async fn get_manifest(
         let schema_id = NonZeroU16::new(1).unwrap();
 
         // We're using nanoseconds in our sqlite database, but the manifest expects ISO timestamps.
-        let start_time = DateTime::from_timestamp_nanos(start_nanos as _);
+        let mut current_start_time = DateTime::from_timestamp_nanos(start_nanos as _);
         let end_time = DateTime::from_timestamp_nanos(end_nanos as _);
 
-        let params = serde_url_params::to_string(&DataQueryParams {
-            topic_name: topic_name.clone(),
-            recording_name: recording.clone(),
-            start_time,
-            end_time,
-        })
-        .map_err(|_| internal_error("failed to serialize url params"))?;
+        loop {
+            // We're splitting up each recording into chunks of 10s to that the Foxglove connector
+            // can avoid downloading data that it doesn't need.
+            let chunk_end_time = (current_start_time + TimeDelta::seconds(10)).min(end_time);
 
-        sources.push(Source {
-            topics: vec![Topic {
-                name: format!("/{topic_name}"),
-                message_encoding: message_encoding.clone(),
-                schema_id: Some(schema_id),
-            }],
-            schemas: vec![Schema {
-                id: schema_id,
-                name: schema.name.clone(),
-                data: schema.data.to_vec(),
-                encoding: schema.encoding.clone(),
-            }],
-            start_time,
-            end_time,
-            // This project expects the server to be hosted at localhost:3000. This should be a
-            // hostname that the external connector can reach from your cluster.
-            data_url: format!("http://localhost:3000/data?{params}"),
-        })
+            let params = serde_url_params::to_string(&DataQueryParams {
+                topic_name: topic_name.clone(),
+                recording_name: recording.clone(),
+                start_time: current_start_time,
+                end_time: chunk_end_time,
+            })
+            .map_err(|_| internal_error("failed to serialize url params"))?;
+
+            // Add the 10s chunk of data to the sources array to be returned in the manifest
+            sources.push(Source {
+                topics: vec![Topic {
+                    name: format!("/{topic_name}"),
+                    message_encoding: message_encoding.clone(),
+                    schema_id: Some(schema_id),
+                }],
+                schemas: vec![Schema {
+                    id: schema_id,
+                    name: schema.name.clone(),
+                    data: schema.data.to_vec(),
+                    encoding: schema.encoding.clone(),
+                }],
+                start_time: current_start_time,
+                end_time: chunk_end_time,
+                // This project expects the server to be hosted at localhost:3000. This should be a
+                // hostname that the external connector can reach from your cluster.
+                data_url: format!("http://localhost:3000/data?{params}"),
+            });
+
+            current_start_time = chunk_end_time + TimeDelta::nanoseconds(1);
+
+            if current_start_time > end_time {
+                break;
+            }
+        }
     }
 
     Ok(Json(Manifest { sources }))
