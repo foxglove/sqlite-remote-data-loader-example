@@ -78,8 +78,8 @@ async fn main() {
             for _ in 0..CHUNK_SIZE {
                 let timestamp = Duration::from_millis(point as u64).as_nanos() as u64;
 
-                let sin_value = ((point as f64) / 10.).sin() * 10.;
-                let cos_value = ((point as f64) / 10.).cos() * 10.;
+                let sin_value = ((point as f64) / 1000.).sin() * 10.;
+                let cos_value = ((point as f64) / 1000.).cos() * 10.;
 
                 builder = builder
                     .param(timestamp)

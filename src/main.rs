@@ -33,6 +33,7 @@ struct Schema {
 #[serde(rename_all = "camelCase")]
 struct Topic {
     name: String,
+    message_encoding: String,
     schema_id: Option<NonZeroU16>,
 }
 
@@ -95,6 +96,7 @@ async fn get_manifest(
            INNER JOIN recordings r ON r.id = s.recording_id
            INNER JOIN topics t ON t.id = s.topic_id
            WHERE r.name = ?
+           GROUP BY t.name
         ",
         asqlite::params!(&recording),
     );
@@ -109,6 +111,8 @@ async fn get_manifest(
     // We use this Point schema created using the Foxglove SDK. It contains most of the fields required
     // by the manifest endpoint.
     let schema = Point::get_schema().expect("point should have schema");
+
+    let message_encoding = Point::get_message_encoding();
 
     for (start_nanos, end_nanos, topic_name) in topics.into_iter() {
         // The schema_id on the topic needs to match the id on the schemas array in the manifest.
@@ -129,7 +133,8 @@ async fn get_manifest(
 
         sources.push(Source {
             topics: vec![Topic {
-                name: topic_name,
+                name: format!("/{topic_name}"),
+                message_encoding: message_encoding.clone(),
                 schema_id: Some(schema_id),
             }],
             schemas: vec![Schema {
@@ -241,7 +246,7 @@ async fn get_data(Query(params): Query<DataQueryParams>) -> Result<Response, Res
         let mut rows = client.query::<(u64, f64)>(
             "SELECT s.timestamp, s.value FROM signals s
                 INNER JOIN topics t ON t.id = s.topic_id
-                INNER JOIN recordings r ON r.id = s.topic_id
+                INNER JOIN recordings r ON r.id = s.recording_id
                 WHERE s.timestamp >= ? AND s.timestamp <= ? AND t.name = ? AND r.name = ?",
             asqlite::params!(start_time_nanos, end_time_nanos, topic_name, recording_name),
         );
@@ -253,9 +258,9 @@ async fn get_data(Query(params): Query<DataQueryParams>) -> Result<Response, Res
 
             let bytes = buffer.take();
 
-            if !bytes.is_empty() {
-                sender.send(bytes).await.expect("failed to send bytes");
-            }
+            if !bytes.is_empty() && sender.send(bytes).await.is_err() {
+                return;
+            };
         }
 
         writer.close().expect("failed to close writer");
@@ -266,10 +271,10 @@ async fn get_data(Query(params): Query<DataQueryParams>) -> Result<Response, Res
         let bytes = buffer.take();
 
         if !bytes.is_empty() {
-            sender.send(bytes).await.expect("failed to send bytes");
+            let _ = sender.send(bytes).await;
         }
 
-        sender.flush().await.unwrap();
+        let _ = sender.flush().await;
     });
 
     Ok((
