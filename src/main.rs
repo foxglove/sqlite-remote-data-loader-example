@@ -42,7 +42,7 @@ struct Topic {
 struct Source {
     topics: Vec<Topic>,
     schemas: Vec<Schema>,
-    data_url: String,
+    url: String,
     start_time: chrono::DateTime<Utc>,
     end_time: chrono::DateTime<Utc>,
 }
@@ -154,7 +154,7 @@ async fn get_manifest(
                 end_time: chunk_end_time,
                 // This project expects the server to be hosted at localhost:3000. This should be a
                 // hostname that the external connector can reach from your cluster.
-                data_url: format!("http://localhost:3000/data?{params}"),
+                url: format!("http://localhost:3000/data?{params}"),
             });
 
             current_start_time = chunk_end_time + TimeDelta::nanoseconds(1);
