@@ -22,8 +22,8 @@ This will launch the server on `localhost:3000`.
 
 ### Visualize Data
 
-To view this data in Foxglove, start an `external-connector` and view recordings with:
+To view this data in Foxglove, start a `remote-data-loader` on `localhost:8080` and view recordings with:
 
 ```
-https://app.foxglove.dev/~/view?ds=experimental-external-connector&connectorUrl=$(url-encode connectorUrl)&manifestUrl=$(url-encode http://localhost:3000/manifest?recording=first-recording)
+https://app.foxglove.dev/~/view?ds=experimental-remote-data-loader&ds.dataLoaderUrl=http://localhost:8080/&ds.recording=first-recording)
 ```
