@@ -168,45 +168,6 @@ async fn get_manifest(
     Ok(Json(Manifest { sources }))
 }
 
-// This is some glue that makes it easier for the Foxglove MCAP writer to return bytes to Axum.
-#[derive(Clone, Default)]
-struct SharedBuffer {
-    buffer: Arc<Mutex<BytesMut>>,
-    pos: u64,
-}
-
-impl SharedBuffer {
-    fn take(&self) -> Bytes {
-        let bytes = &mut *self.buffer.lock().expect("poisoned");
-        bytes.split().freeze()
-    }
-}
-
-impl Write for SharedBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let bytes = &mut *self.buffer.lock().expect("poisoned");
-        bytes.put_slice(buf);
-        self.pos += buf.len() as u64;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-// We set the `disable_seeking` option on the MCAP writer to ensure that it doesn't seek. This impl
-// makes sure it can still get the current position of the stream.
-impl Seek for SharedBuffer {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        match pos {
-            SeekFrom::Start(n) if self.pos == n => Ok(n),
-            SeekFrom::Current(0) => Ok(self.pos),
-            _ => Err(std::io::Error::other("seek on unseekable file")),
-        }
-    }
-}
-
 #[derive(foxglove::Encode)]
 struct Point {
     value: f64,
@@ -234,18 +195,11 @@ async fn get_data(Query(params): Query<DataQueryParams>) -> Result<Response, Res
     )
     .map_err(|_| internal_error("end time was negative"))?;
 
-    let (mut sender, recv) = futures::channel::mpsc::channel::<Bytes>(2);
+    let context = Context::new();
+
+    let (mut handle, stream) = context.mcap_stream().create().unwrap();
 
     tokio::spawn(async move {
-        let buffer = SharedBuffer::default();
-
-        let context = Context::new();
-
-        let writer = McapWriter::with_options(McapWriteOptions::new().disable_seeking(true))
-            .context(&context)
-            .create(buffer.clone())
-            .expect("failed to create writer");
-
         let channel = context
             .channel_builder(format!("/{topic_name}"))
             .build::<Point>();
@@ -270,30 +224,27 @@ async fn get_data(Query(params): Query<DataQueryParams>) -> Result<Response, Res
         {
             channel.log_with_time(&Point { value }, timestamp);
 
-            let bytes = buffer.take();
+            let max_buffer_size = 1024 * 1024;
 
-            if !bytes.is_empty() && sender.send(bytes).await.is_err() {
-                return;
-            };
+            if handle.buffer_size() <= max_buffer_size {
+                continue;
+            }
+
+            // An error on flush means the client disconnected. Just ignore the error and exit.
+            if handle.flush().await.is_err() {
+                break;
+            }
         }
 
-        writer.close().expect("failed to close writer");
+        let _ = handle.close().await;
 
         // If the context is dropped before the writer is closed it'll stop logging messages
         drop(context);
-
-        let bytes = buffer.take();
-
-        if !bytes.is_empty() {
-            let _ = sender.send(bytes).await;
-        }
-
-        let _ = sender.flush().await;
     });
 
     Ok((
         StatusCode::OK,
-        Body::from_stream(recv.map(Ok::<_, Infallible>)),
+        Body::from_stream(stream.map(Ok::<_, Infallible>)),
     )
         .into_response())
 }
