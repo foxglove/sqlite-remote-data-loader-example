@@ -425,9 +425,9 @@ dependencies = [
 
 [[package]]
 name = "foxglove"
-version = "0.15.3"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f1beaccd7a2762e9a3ed780391b7bfb4d16381fb2917c193cc141d3989af64"
+checksum = "73603c04728cfe0c74fa716c03afbe318631e573916f4f0e603942819656042e"
 dependencies = [
  "arc-swap",
  "base64",
@@ -436,6 +436,7 @@ dependencies = [
  "delegate",
  "flume",
  "foxglove_derive",
+ "futures",
  "futures-util",
  "mcap",
  "parking_lot",
@@ -457,9 +458,9 @@ dependencies = [
 
 [[package]]
 name = "foxglove_derive"
-version = "0.15.3"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26aeedb12388816bf2174505e8e9b8bf76b98e0b1da7dc5430fd58df97c9103b"
+checksum = "65af35a8896d83132d52968376df88ba09a2e5f385e60864aaacb18b582b5fe0"
 dependencies = [
  "proc-macro2",
  "prost-types",
@@ -966,9 +967,9 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcap"
-version = "0.23.4"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a3ca583fed649ed7cd8c976b59422996472c6b08067308443e0b60c56e0a4ca"
+checksum = "43908ab970f3a880b02834055a1e04221a3056f442a65ae9111f63e550e7daa5"
 dependencies = [
  "bimap",
  "binrw",
@@ -1656,9 +1657,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.27.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "489a59b6730eda1b0171fcfda8b121f4bee2b35cba8645ca35c5f7ba3eb736c1"
+checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
 dependencies = [
  "futures-util",
  "log",
@@ -1742,9 +1743,9 @@ dependencies = [
 
 [[package]]
 name = "tungstenite"
-version = "0.27.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eadc29d668c91fcc564941132e17b28a7ceb2f3ebf0b9dae3e03fd7a6748eb0d"
+checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
 dependencies = [
  "bytes",
  "data-encoding",

@@ -1,6 +1,6 @@
-# sqlite-connector-upstream-example
+# sqlite-remote-data-loader-example
 
-This is an example connector upstream API that connects to an SQLITE database.
+This is an example remote data loader upstream API that connects to an SQLite database.
 
 ## Running
 
