@@ -27,3 +27,7 @@ To view this data in Foxglove, start a `remote-data-loader` on `localhost:8080` 
 ```
 https://app.foxglove.dev/~/view?ds=experimental-remote-data-loader&ds.dataLoaderUrl=http://localhost:8080/&ds.recording=first-recording)
 ```
+
+How to run it
+
+# 1. Start InfluxDBdocker compose up -d# 2. Seed with sample data./scripts/seed.sh# 3. Run the servercargo run --bin server# 4. Test the manifestcurl 'http://localhost:3000/manifest?measurement=airSensors'

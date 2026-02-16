@@ -6,9 +6,8 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::get};
-use bytes::BufMut;
 use chrono::{DateTime, TimeDelta, Utc};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
@@ -19,15 +18,30 @@ use foxglove::Encode;
 // The `create_mcap_stream` helper is used to write MCAP messages to a streaming Axum response.
 use foxglove::stream::create_mcap_stream;
 
-mod manifest_types {
-    //! This module contains all the types required to serialize the manifest. These use serde and
-    //! serde_json and conform to the manifest JSON schema.
+use influxdb2::Client;
+use influxdb2::models::Query as FluxQuery;
+use influxdb2_structmap::value::Value;
 
+// ---------------------------------------------------------------------------
+// InfluxDB configuration – matches docker-compose.yml defaults
+// ---------------------------------------------------------------------------
+const INFLUXDB_URL: &str = "http://localhost:8086";
+const INFLUXDB_ORG: &str = "myorg";
+const INFLUXDB_TOKEN: &str = "my-super-secret-token";
+const INFLUXDB_BUCKET: &str = "mybucket";
+
+fn influx_client() -> Client {
+    Client::new(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_TOKEN)
+}
+
+// ---------------------------------------------------------------------------
+// Manifest types – these conform to the Foxglove remote data loader manifest
+// JSON schema.
+// ---------------------------------------------------------------------------
+mod manifest_types {
     use super::*;
 
     /// A schema describes the data that exists within a topic.
-    ///
-    /// It can be produced using the Foxglove SDK.
     #[serde_as]
     #[derive(Serialize, Clone)]
     #[serde(rename_all = "camelCase")]
@@ -40,8 +54,6 @@ mod manifest_types {
     }
 
     /// A topic has a name, message encoding and an optional schema.
-    ///
-    /// The message encoding and schema can be produced by the Foxglove SDK.
     #[derive(Serialize, Clone)]
     #[serde(rename_all = "camelCase")]
     pub struct Topic {
@@ -50,10 +62,7 @@ mod manifest_types {
         pub schema_id: Option<NonZeroU16>,
     }
 
-    /// A source that the remote data can load to service requests from the Foxglove app.
-    ///
-    /// It must contain a list of topics the source contains and their schemas, as well as the
-    /// start and end times of the underlying data.
+    /// A source returned inside the manifest.
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Source {
@@ -72,122 +81,173 @@ mod manifest_types {
     }
 }
 
-/// These query params are passed by the Foxglove app, through the remote data loader and to the
-/// manifest endpoint. They are used to return the appropriate sources to service whatever
-/// data is requested through the params.
-///
-/// For this example we have a single param called "recording". It will be configured through the
-/// app by adding `ds.recording=` to the URL.
+// ---------------------------------------------------------------------------
+// Query parameter types
+// ---------------------------------------------------------------------------
+
+/// Manifest query params – passed by the Foxglove app via `ds.measurement=…` in the URL.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestQueryParams {
-    recording: String,
+    measurement: String,
 }
 
-// These query parameters are an implementation detail of this upstream API. They are used for
-// constructing the source URL.
+/// Source URL query params – these are internal to this upstream API and encode what data a
+/// particular source URL should return.
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SourceUrlQueryParams {
-    topic_name: String,
-    recording_name: String,
+    measurement: String,
+    field: String,
     start_time: chrono::DateTime<Utc>,
     end_time: chrono::DateTime<Utc>,
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn internal_error(msg: impl Into<String>) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, msg.into()).into_response()
 }
 
-/// This endpoint returns a manifest file for the requested recording.
+/// Extract a `DateTime<Utc>` from a FluxRecord's `_time` value.
+fn extract_time(record: &influxdb2::api::query::FluxRecord) -> Option<DateTime<Utc>> {
+    match record.values.get("_time")? {
+        Value::TimeRFC(dt) => Some(dt.with_timezone(&Utc)),
+        _ => None,
+    }
+}
+
+/// Extract a `f64` from a FluxRecord's `_value` value.
+fn extract_f64_value(record: &influxdb2::api::query::FluxRecord) -> Option<f64> {
+    record.values.get("_value")?.f64()
+}
+
+/// Extract a string from a FluxRecord's `_value` value.
+#[allow(dead_code)]
+fn extract_string_value(record: &influxdb2::api::query::FluxRecord) -> Option<String> {
+    record.values.get("_value")?.string()
+}
+
+// ---------------------------------------------------------------------------
+// GET /manifest
+// ---------------------------------------------------------------------------
+
+/// Returns a manifest for the requested InfluxDB measurement.
 ///
-/// This manifest returns separate source URLs for each topic in 10s chunks to demonstrate how a
-/// single recording could be split up into multiple source URLs. It is recommended to split up
-/// your recording into reasonable time ranges so that only the data that is needed is downloaded
-/// by the connector. You may also group topics that are commonly used in the same layouts
-/// together, or split topics out that are quite large into their own source URL.
+/// Each _field_ in the measurement becomes a separate Foxglove topic (e.g.
+/// `/airSensors/temperature`). The time range is split into 60-second chunks so the Foxglove
+/// connector can avoid downloading data it doesn't need.
 async fn get_manifest(
     Query(params): Query<ManifestQueryParams>,
 ) -> Result<Json<manifest_types::Manifest>, Response> {
-    let ManifestQueryParams { recording } = params;
+    let ManifestQueryParams { measurement } = params;
+    let client = influx_client();
 
-    let mut client = asqlite::Connection::builder()
-        .create(false)
-        .write(false)
-        .open("signals.db")
+    // --- Discover the field names for this measurement ---------------------------
+    // The influxdb2 crate has a built-in helper that uses the Flux `schema` package.
+    let field_names = client
+        .list_measurement_field_keys(INFLUXDB_BUCKET, &measurement, Some("0"), None)
         .await
-        .expect("failed to open db");
+        .map_err(|e| {
+            eprintln!("Failed to query field keys: {e}");
+            internal_error("failed to query field keys from InfluxDB")
+        })?;
 
-    // Query all the topics for this recording and their start and end times.
-    let topics = client.query::<(u64, u64, String)>(
-        "select min(s.timestamp), max(s.timestamp), t.name FROM signals s
-           INNER JOIN recordings r ON r.id = s.recording_id
-           INNER JOIN topics t ON t.id = s.topic_id
-           WHERE r.name = ?
-           GROUP BY t.name
-        ",
-        asqlite::params!(&recording),
-    );
+    if field_names.is_empty() {
+        return Err(internal_error(format!(
+            "no fields found for measurement \"{measurement}\""
+        )));
+    }
 
-    let topics = topics.try_collect::<Vec<_>>().await.map_err(|e| {
-        eprintln!("failed to read manifest from db: {e}");
-        internal_error("failed to read manifest from db")
-    })?;
+    // --- Determine the time bounds of the data -----------------------------------
+    let first_query = FluxQuery::new(format!(
+        r#"from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: 0)
+  |> filter(fn: (r) => r._measurement == "{measurement}")
+  |> group()
+  |> sort(columns: ["_time"], desc: false)
+  |> limit(n: 1)
+  |> keep(columns: ["_time"])"#
+    ));
+    let last_query = FluxQuery::new(format!(
+        r#"from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: 0)
+  |> filter(fn: (r) => r._measurement == "{measurement}")
+  |> group()
+  |> sort(columns: ["_time"], desc: true)
+  |> limit(n: 1)
+  |> keep(columns: ["_time"])"#
+    ));
 
-    let mut sources = vec![];
+    let (first_records, last_records) = tokio::try_join!(
+        async {
+            client.query_raw(Some(first_query)).await.map_err(|e| {
+                eprintln!("Failed to query first time: {e}");
+                internal_error("failed to query time bounds")
+            })
+        },
+        async {
+            client.query_raw(Some(last_query)).await.map_err(|e| {
+                eprintln!("Failed to query last time: {e}");
+                internal_error("failed to query time bounds")
+            })
+        },
+    )?;
 
-    // We use this Point schema created using the Foxglove SDK. It contains most of the fields required
-    // by the manifest endpoint.
-    let schema = Point::get_schema().expect("point should have schema");
+    let start_time = first_records
+        .first()
+        .and_then(extract_time)
+        .ok_or_else(|| internal_error("no data found for measurement (start)"))?;
 
+    let end_time = last_records
+        .first()
+        .and_then(extract_time)
+        .ok_or_else(|| internal_error("no data found for measurement (end)"))?;
+
+    // --- Build the manifest ------------------------------------------------------
+    let schema = Point::get_schema().expect("Point should have a schema");
     let message_encoding = Point::get_message_encoding();
+    let schema_id = NonZeroU16::new(1).unwrap();
 
-    for (start_nanos, end_nanos, topic_name) in topics.into_iter() {
-        // The schema_id on the topic needs to match the id on the schemas array in the manifest.
-        // This repo only uses a single schema - so just hard code this to one.
-        let schema_id = NonZeroU16::new(1).unwrap();
+    let mut sources = Vec::new();
 
-        // We're using nanoseconds in our sqlite database, but the manifest expects ISO timestamps.
-        let mut current_start_time = DateTime::from_timestamp_nanos(start_nanos as _);
-        let end_time = DateTime::from_timestamp_nanos(end_nanos as _);
+    for field_name in &field_names {
+        let mut current_start = start_time;
 
         loop {
-            // We're splitting up each recording into chunks of 10s to that the Foxglove connector
-            // can avoid downloading data that it doesn't need.
-            let chunk_end_time = (current_start_time + TimeDelta::seconds(10)).min(end_time);
+            // Split data into 60-second chunks so only the needed data is downloaded.
+            let chunk_end = (current_start + TimeDelta::seconds(60)).min(end_time);
 
-            let params = serde_url_params::to_string(&SourceUrlQueryParams {
-                topic_name: topic_name.clone(),
-                recording_name: recording.clone(),
-                start_time: current_start_time,
-                end_time: chunk_end_time,
+            let url_params = serde_url_params::to_string(&SourceUrlQueryParams {
+                measurement: measurement.clone(),
+                field: field_name.clone(),
+                start_time: current_start,
+                end_time: chunk_end,
             })
             .map_err(|_| internal_error("failed to serialize url params"))?;
 
-            // Add the 10s chunk of data to the sources array to be returned in the manifest.
             sources.push(manifest_types::Source {
                 topics: vec![manifest_types::Topic {
-                    name: format!("/{topic_name}"),
+                    name: format!("/{measurement}/{field_name}"),
                     message_encoding: message_encoding.clone(),
                     schema_id: Some(schema_id),
                 }],
-                // The schemas for the source can be produced using the schema from the SDK.
                 schemas: vec![manifest_types::Schema {
                     id: schema_id,
                     name: schema.name.clone(),
                     data: schema.data.to_vec(),
                     encoding: schema.encoding.clone(),
                 }],
-                start_time: current_start_time,
-                end_time: chunk_end_time,
-                // This project expects the server to be hosted at localhost:3000. This should be a
-                // hostname that the remote data loader can reach from your cluster.
-                url: format!("http://localhost:3000/data?{params}"),
+                start_time: current_start,
+                end_time: chunk_end,
+                // The remote data loader must be able to reach this URL.
+                url: format!("http://localhost:3000/data?{url_params}"),
             });
 
-            current_start_time = chunk_end_time + TimeDelta::nanoseconds(1);
-
-            if current_start_time > end_time {
+            current_start = chunk_end + TimeDelta::nanoseconds(1);
+            if current_start > end_time {
                 break;
             }
         }
@@ -196,76 +256,72 @@ async fn get_manifest(
     Ok(Json(manifest_types::Manifest { sources }))
 }
 
-/// The simple schema returned by this API.
-///
-/// In practice, you'll have multiple different message types / schemas that likely use the Foxglove
-/// built in message schemas.
+// ---------------------------------------------------------------------------
+// The simple schema for every data point we return.
+// ---------------------------------------------------------------------------
 #[derive(foxglove::Encode)]
 struct Point {
     value: f64,
 }
 
-/// This endpoint is the "source URL" provided by the manifest. It returns a streaming MCAP
-/// response that will be ingested by the remote data loader.
+// ---------------------------------------------------------------------------
+// GET /data
+// ---------------------------------------------------------------------------
+
+/// Returns a streaming MCAP response for a given measurement + field + time range.
+///
+/// This is the "source URL" provided in the manifest. The Foxglove remote data loader calls it
+/// to fetch the actual data.
 async fn get_data(Query(params): Query<SourceUrlQueryParams>) -> Result<Response, Response> {
     let SourceUrlQueryParams {
-        topic_name,
-        recording_name,
+        measurement,
+        field,
         start_time,
         end_time,
     } = params;
-
-    let start_time_nanos = u64::try_from(
-        start_time
-            .timestamp_nanos_opt()
-            .ok_or_else(|| internal_error("failed to convert start time to nanos"))?,
-    )
-    .map_err(|_| internal_error("start time was negative"))?;
-
-    let end_time_nanos = u64::try_from(
-        end_time
-            .timestamp_nanos_opt()
-            .ok_or_else(|| internal_error("failed to convert end time to nanos"))?,
-    )
-    .map_err(|_| internal_error("end time was negative"))?;
 
     // Create an `McapStream` that can be returned from this handler.
     let (mut handle, stream) = create_mcap_stream();
 
     tokio::spawn(async move {
         let channel = handle
-            .channel_builder(format!("/{topic_name}"))
+            .channel_builder(format!("/{measurement}/{field}"))
             .build::<Point>();
 
-        let mut client = asqlite::Connection::builder()
-            .create(false)
-            .write(false)
-            .open("signals.db")
-            .await
-            .expect("failed to open db");
+        let client = influx_client();
 
-        let mut rows = client.query::<(u64, f64)>(
-            "SELECT s.timestamp, s.value FROM signals s
-                INNER JOIN topics t ON t.id = s.topic_id
-                INNER JOIN recordings r ON r.id = s.recording_id
-                WHERE s.timestamp >= ? AND s.timestamp <= ? AND t.name = ? AND r.name = ?",
-            asqlite::params!(start_time_nanos, end_time_nanos, topic_name, recording_name),
-        );
+        let data_query = FluxQuery::new(format!(
+            r#"from(bucket: "{INFLUXDB_BUCKET}")
+  |> range(start: {start}, stop: {stop})
+  |> filter(fn: (r) => r._measurement == "{measurement}" and r._field == "{field}")
+  |> sort(columns: ["_time"])"#,
+            start = start_time.to_rfc3339(),
+            stop = end_time.to_rfc3339(),
+        ));
 
-        while let Some(next) = rows.next().await {
-            let (timestamp, value) = next.expect("failed to read row");
+        let records = match client.query_raw(Some(data_query)).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Failed to query data: {e}");
+                return;
+            }
+        };
 
-            channel.log_with_time(&Point { value }, timestamp);
+        for record in &records {
+            let Some(time) = extract_time(record) else {
+                continue;
+            };
+            let Some(value) = extract_f64_value(record) else {
+                continue;
+            };
 
-            // Only flush the buffer if enough data has accumulated. There's no point in flushing
-            // every individual message.
+            let timestamp_nanos = time.timestamp_nanos_opt().unwrap_or(0) as u64;
+            channel.log_with_time(&Point { value }, timestamp_nanos);
+
+            // Only flush when enough data has accumulated – no point flushing every message.
             if handle.buffer_size() > 4096 {
-                let res = handle.flush().await;
-
-                // If flushing the handle causes an error it is due to the stream being closed.
-                // Stop writing as we won't be able to flush any more data.
-                if res.is_err() {
-                    return;
+                if handle.flush().await.is_err() {
+                    return; // Stream closed – stop writing.
                 }
             }
         }
@@ -280,15 +336,21 @@ async fn get_data(Query(params): Query<SourceUrlQueryParams>) -> Result<Response
         .into_response())
 }
 
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() {
     let app = Router::new()
-        // The manifest endpoint required by the remote data loader
+        // The manifest endpoint required by the remote data loader.
+        // Query with ?measurement=airSensors (or whatever measurement your data uses).
         .route("/manifest", get(get_manifest))
-        // The data that backs the "source url" provided in the manifest
+        // The data that backs the "source url" provided in the manifest.
         .route("/data", get(get_data));
 
     println!("Listening on http://127.0.0.1:3000");
+    println!("Try: curl 'http://localhost:3000/manifest?measurement=airSensors'");
 
     axum::serve(
         tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap(),

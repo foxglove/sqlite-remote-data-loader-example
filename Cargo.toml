@@ -7,17 +7,13 @@ edition = "2024"
 name = "server"
 path = "src/main.rs"
 
-[[bin]]
-name = "seed"
-path = "src/bin/seed.rs"
-
 [dependencies]
-asqlite = { version = "1.2.0", features = [ "bundled" ] }
 axum = "0.8.6"
-bytes = "1.10.1"
 chrono = { version = "0.4.42", features = [ "serde" ] }
 foxglove = { version = "0.16.2", features = [ "stream" ] }
 futures = "0.3.31"
+influxdb2 = "0.5"
+influxdb2-structmap = "0.2"
 serde = { version = "1.0.228", features = [ "derive" ] }
 serde_url_params = "0.2.1"
 serde_with = { version = "3.15.1", features = [ "base64" ] }
