@@ -68,6 +68,7 @@ mod manifest_types {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Manifest {
+        pub name: String,
         pub sources: Vec<Source>,
     }
 }
@@ -193,7 +194,10 @@ async fn get_manifest(
         }
     }
 
-    Ok(Json(manifest_types::Manifest { sources }))
+    Ok(Json(manifest_types::Manifest {
+        sources,
+        name: recording,
+    }))
 }
 
 /// The simple schema returned by this API.
